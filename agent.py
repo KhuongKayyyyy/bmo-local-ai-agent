@@ -156,6 +156,33 @@ def choose_input_samplerate(device, preferred=None):
 
     return int(candidates[0]) if candidates else 44100
 
+
+def choose_output_samplerate(preferred=None):
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+
+    try:
+        device_info = sd.query_devices(kind='output')
+        if "default_samplerate" in device_info:
+            candidates.append(int(device_info["default_samplerate"]))
+    except Exception:
+        pass
+
+    candidates.extend([22050, 24000, 32000, 44100, 48000])
+    seen = set()
+    for rate in candidates:
+        if not rate or rate in seen:
+            continue
+        seen.add(rate)
+        try:
+            sd.check_output_settings(device=None, samplerate=rate, channels=1, dtype="int16")
+            return rate
+        except Exception:
+            continue
+
+    return 48000
+
 class BotStates:
     IDLE = "idle"             
     LISTENING = "listening"   
@@ -239,6 +266,7 @@ class BotGUI:
         self.tts_thread = None       
         self.tts_active = threading.Event()
         self.current_audio_process = None 
+        self.audio_output_lock = threading.Lock()
         self.exiting = False
         
         # --- WAKE WORD INITIALIZATION ---
@@ -953,6 +981,14 @@ class BotGUI:
             with self.tts_queue_lock:
                 if self.tts_queue: 
                     text = self.tts_queue.pop(0)
+
+                    # Merge short consecutive chunks so Piper doesn't restart for each tiny sentence.
+                    while self.tts_queue and len(text) < 220:
+                        nxt = self.tts_queue[0]
+                        if len(text) + len(nxt) + 1 > 240:
+                            break
+                        text += " " + self.tts_queue.pop(0)
+
                     self.tts_active.set() 
             if text: 
                 self.speak(text)
@@ -967,49 +1003,49 @@ class BotGUI:
         voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
         
         try:
-            self.current_audio_process = subprocess.Popen(
-                ["./piper/piper", "--model", voice_model, "--output-raw"], 
-                stdin=subprocess.PIPE, 
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            
-            self.current_audio_process.stdin.write(clean.encode() + b'\n')
-            self.current_audio_process.stdin.close() 
+            with self.audio_output_lock:
+                self.current_audio_process = subprocess.Popen(
+                    ["./piper/piper", "--model", voice_model, "--output-raw"], 
+                    stdin=subprocess.PIPE, 
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL
+                )
+                
+                self.current_audio_process.stdin.write(clean.encode() + b'\n')
+                self.current_audio_process.stdin.close() 
 
-            try:
-                device_info = sd.query_devices(kind='output')
-                native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000 
+                piper_rate = 22050
+                output_rate = choose_output_samplerate(preferred=piper_rate)
+                needs_resample = (output_rate != piper_rate)
 
-            PIPER_RATE = 22050
-            use_native_rate = False
-            
-            try:
-                sd.check_output_settings(device=None, samplerate=PIPER_RATE)
-            except:
-                use_native_rate = True
+                with sd.RawOutputStream(
+                    samplerate=output_rate,
+                    channels=1,
+                    dtype='int16',
+                    device=None,
+                    latency='high',
+                    blocksize=4096
+                ) as stream:
+                    while True:
+                        if self.interrupted.is_set(): break
+                        data = self.current_audio_process.stdout.read(4096)
+                        if not data: break 
+                        
+                        audio_chunk = np.frombuffer(data, dtype=np.int16)
+                        if len(audio_chunk) > 0:
+                            self.current_volume = np.max(np.abs(audio_chunk))
 
-            with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE, 
-                                    channels=1, dtype='int16', 
-                                    device=None, latency='low', blocksize=2048) as stream:
-                while True:
-                    if self.interrupted.is_set(): break
-                    data = self.current_audio_process.stdout.read(4096)
-                    if not data: break 
-                    
-                    audio_chunk = np.frombuffer(data, dtype=np.int16)
-                    if len(audio_chunk) > 0:
-                        self.current_volume = np.max(np.abs(audio_chunk))
-                        if use_native_rate:
-                            num_samples = int(len(audio_chunk) * (native_rate / PIPER_RATE))
-                            audio_chunk = scipy.signal.resample(audio_chunk, num_samples).astype(np.int16)
-                        stream.write(audio_chunk.tobytes())
-                    else:
-                        self.current_volume = 0
-                time.sleep(0.5) 
-                    
+                            if needs_resample:
+                                num_samples = int(len(audio_chunk) * (output_rate / piper_rate))
+                                if num_samples > 1:
+                                    x_old = np.linspace(0.0, 1.0, num=len(audio_chunk), endpoint=False)
+                                    x_new = np.linspace(0.0, 1.0, num=num_samples, endpoint=False)
+                                    audio_chunk = np.interp(x_new, x_old, audio_chunk).astype(np.int16)
+
+                            stream.write(audio_chunk.tobytes())
+                        else:
+                            self.current_volume = 0
+
         except Exception as e:
             print(f"Audio Error: {e}")
         finally:
@@ -1022,6 +1058,9 @@ class BotGUI:
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)
         while self.thinking_sound_active.is_set():
+            if self.tts_active.is_set() or self.tts_queue:
+                time.sleep(0.1)
+                continue
             sound = self.get_random_sound(thinking_sounds_dir)
             if sound: self.play_sound(sound)
             for _ in range(50):
@@ -1042,22 +1081,17 @@ class BotGUI:
                 data = wf.readframes(wf.getnframes())
                 audio = np.frombuffer(data, dtype=np.int16)
 
-            try:
-                device_info = sd.query_devices(kind='output')
-                native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000 
+            playback_rate = choose_output_samplerate(preferred=file_sr)
+            if playback_rate != file_sr:
+                num_samples = int(len(audio) * (playback_rate / file_sr))
+                if num_samples > 1:
+                    x_old = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+                    x_new = np.linspace(0.0, 1.0, num=num_samples, endpoint=False)
+                    audio = np.interp(x_new, x_old, audio).astype(np.int16)
 
-            playback_rate = file_sr
-            try:
-                sd.check_output_settings(device=None, samplerate=file_sr)
-            except:
-                playback_rate = native_rate
-                num_samples = int(len(audio) * (native_rate / file_sr))
-                audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
-
-            sd.play(audio, playback_rate)
-            sd.wait() 
+            with self.audio_output_lock:
+                sd.play(audio, playback_rate)
+                sd.wait() 
         except: pass
 
     def load_chat_history(self):
